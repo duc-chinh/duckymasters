@@ -1,18 +1,1 @@
-const status = document.getElementById("status");
-
-async function send(type, successMessage) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id || !tab.url?.startsWith("https://www.wiki-masters.com/")) {
-    status.textContent = "Ouvre une page WikiMasters dans cet onglet.";
-    return;
-  }
-  try {
-    await chrome.tabs.sendMessage(tab.id, { type });
-    status.textContent = successMessage;
-  } catch (_) {
-    status.textContent = "Commande envoyée.";
-  }
-}
-
-document.getElementById("averages").onclick = () => send("wm-average-start", "Calcul des moyennes lancé.");
-document.getElementById("auction").onclick = () => send("dm-auction-prepare", "Préparation des enchères ouverte.");
+const s=document.querySelector("#s");async function go(type){let[t]=await chrome.tabs.query({active:true,currentWindow:true});if(!t?.id)return;s.textContent="Commande envoyée.";chrome.tabs.sendMessage(t.id,{type})}document.querySelector("#a").onclick=()=>go("wm-average-start");document.querySelector("#b").onclick=()=>go("dm-auction-prepare");

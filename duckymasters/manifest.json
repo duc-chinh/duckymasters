@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DuckyMasters",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Outils personnels pour WikiMasters.",
   "permissions": [
     "storage"
@@ -9,6 +9,12 @@
   "host_permissions": [
     "https://www.wiki-masters.com/*"
   ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "content_scripts": [
     {
       "matches": [
@@ -25,6 +31,12 @@
   ],
   "action": {
     "default_title": "DuckyMasters",
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   }
 }
