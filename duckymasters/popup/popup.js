@@ -20,6 +20,21 @@
         "content/entry.js",
       ],
     },
+    {
+      id: "bulk-auction",
+      emoji: "⚖️",
+      title: "Mise aux enchères groupée",
+      description: "Met aux enchères les cartes sélectionnées dans la collection.",
+      appliesTo: ["collection"],
+      mainFiles: ["content/main-tagger.js"],
+      files: [
+        "content/site-config.js",
+        "content/site-adapter.js",
+        "content/auction-adapter.js",
+        "content/auction-panel.js",
+        "content/auction-entry.js",
+      ],
+    },
   ];
 
   const statusEl = document.getElementById("dm-status");

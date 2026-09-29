@@ -109,6 +109,13 @@
       await this.start({ restart: true });
     }
 
+    /** Reprend sans rien effacer : retente uniquement les cartes en erreur. */
+    async relaunch() {
+      this._log({ type: "info", text: "Relance du script - reprise sur les cartes en erreur."});
+      this.state = "idle"; // autorise start() même depuis "done"/"stopped"
+      await this.start({ restart: false });
+    }
+
     stop() {
       this._setState("stopped");
       this._log({ type: "info", text: "Script arrêté." });
@@ -176,14 +183,14 @@
         }
 
         let nodes = Adapter.getCardNodes();
-        this._reportProgress(nodes.filter((n) => Adapter.hasBadge(n)).length, nodes.length);
-        let next = nodes.find((n) => !Adapter.hasBadge(n));
+        this._reportProgress(nodes.filter((n) => Adapter.isDone(n)).length, nodes.length);
+        let next = nodes.find((n) => !Adapter.isDone(n));
 
         if (!next) {
           // Peut-être des cartes re-rendues par le site depuis le dernier marquage.
           Adapter.refreshTags();
           nodes = Adapter.getCardNodes();
-          next = nodes.find((n) => !Adapter.hasBadge(n));
+          next = nodes.find((n) => !Adapter.isDone(n));
         }
 
         if (!next) {
@@ -210,7 +217,7 @@
           Adapter.injectBadge(next, { average, rarity });
         } catch (err) {
           this._log({ type: "error", text: `Échec pour la carte ${cardId} : ${err.message}` });
-          Adapter.injectBadge(next, { average: null, rarity });
+          Adapter.injectBadge(next, { average: null, rarity, errorCode: err.code || "server" });
         }
 
         await sleep(CFG.requestDelayMs);
@@ -226,7 +233,7 @@
         this._setState("stopped");
         return;
       }
-      if (this._scrollTop0 !== null) Adapter.setScrollTop(this._scrollTop0);
+      // if (this._scrollTop0 !== null) Adapter.setScrollTop(this._scrollTop0);
       this._reportProgress(total, total);
       this._log({ type: "info", text: "Toutes les cartes affichées ont été traitées." });
       this._setState("done");
@@ -248,7 +255,9 @@
 
       if (!res.ok) {
         this._log({ type: "error", text: `← ${res.status} ${res.statusText} (${ms} ms) — carte ${cardId}` });
-        throw new Error(`HTTP ${res.status}`);
+        const err = new Error(`HTTP ${res.status}`);
+        err.code = res.status;
+        throw err;
       }
       this._log({ type: "response", text: `← ${res.status} (${ms} ms) — carte ${cardId} [${rarity}]` });
 

@@ -18,12 +18,11 @@
       right: 20px;
       bottom: 20px;
       z-index: 2147483647;
-      width: 300px;
+      width: 320px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       color: #F7F4EC;
       box-shadow: 0 8px 24px rgba(0,0,0,0.28);
       border-radius: 14px;
-      overflow: hidden;
       border: 1px solid rgba(247,244,236,0.14);
     }
     .dm-header {
@@ -32,6 +31,7 @@
       gap: 10px;
       padding: 12px 14px;
       background: #173747;
+      border-radius: 14px 14px 0 0;
       cursor: grab;
       user-select: none;
       -webkit-user-select: none;
@@ -51,7 +51,11 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .dm-body { background: #1F4356; padding: 12px 14px 10px; }
+    .dm-body {
+      background: #1F4356;
+      padding: 12px 14px 10px;
+      border-radius: 0 0 14px 14px;
+    }
     .dm-progress-row {
       display: flex;
       align-items: center;
@@ -85,7 +89,8 @@
     .dm-actions { display: flex; flex-wrap: wrap; gap: 6px; }
     .dm-btn {
       flex: 1;
-      min-width: 64px;
+      min-width: max-content;
+      white-space: nowrap;
       cursor: pointer;
       border: 1px solid rgba(247,244,236,0.2);
       background: transparent;
@@ -103,11 +108,18 @@
     .dm-btn.dm-btn--active { background: rgba(247,244,236,0.16); }
     .dm-console {
       display: none;
-      margin-top: 10px;
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 100%;
+      margin-bottom: 8 px;
+      z-index: 5;
       max-height: 190px;
       overflow-y: auto;
       background: #10262F;
       border-radius: 8px;
+      border: 1px solid rgba(247,244,236,0.14);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.28);
       padding: 8px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 11px;
@@ -195,9 +207,10 @@
       // Console panel
       const consolePanel = el("div", { class: "dm-console" });
 
-      const body = el("div", { class: "dm-body" }, [resultEl, progressRow, actionsRow, consolePanel]);
+      const body = el("div", { class: "dm-body" }, [resultEl, progressRow, actionsRow]);
       root.appendChild(header);
       root.appendChild(body);
+      root.appendChild(consolePanel);
       shadow.appendChild(root);
       document.documentElement.appendChild(host);
 
@@ -283,19 +296,17 @@
         closeBtn.addEventListener("click", () => opts.onClose && opts.onClose());
 
         if (state === "paused") {
-          const continueBtn = el("button", {
-            class: "dm-btn dm-btn--primary",
-            type: "button",
-            text: "Continuer",
-          });
+          const continueBtn = el("button", { class: "dm-btn dm-btn--primary", type: "button", text: "Continuer" });
           continueBtn.addEventListener("click", () => opts.onContinue && opts.onContinue());
           const restartBtn = el("button", { class: "dm-btn", type: "button", text: "Recommencer" });
           restartBtn.addEventListener("click", () => opts.onRestart && opts.onRestart());
           actionsRow.append(continueBtn, restartBtn, consoleBtn, closeBtn);
+        } else if (state === "done" || state === "stopped") {
+          const launchBtn = el("button", { class: "dm-btn dm-btn--primary", type: "button", text: "Lancer" });
+          launchBtn.addEventListener("click", () => opts.onRelaunch && opts.onRelaunch());
+          actionsRow.append(launchBtn, consoleBtn, closeBtn);
         } else {
           const pauseBtn = el("button", { class: "dm-btn", type: "button", text: "Pause" });
-          pauseBtn.disabled = state === "done" || state === "stopped";
-          pauseBtn.style.opacity = pauseBtn.disabled ? "0.5" : "1";
           pauseBtn.addEventListener("click", () => opts.onPause && opts.onPause());
           actionsRow.append(pauseBtn, consoleBtn, closeBtn);
         }

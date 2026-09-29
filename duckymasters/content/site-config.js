@@ -38,19 +38,44 @@
       manualCardItem: "", // sélecteur CSS d'une carte, ex: ".card-item"
       manualIdAttribute: "", // attribut portant l'id de carte, ex: "data-id"
       manualRaritySelector: "", // sous-élément affichant la rareté, ex: ".rarity"
+    
+      // ⚠️ Sélection multiple (page Collection) — utilisés par auction-adapter.js.
+      // Icône affichée sur une carte cochée via la sélection native du site.
+      checkIconSelector: "span.pointer-events-none svg.lucide-check, span[aria-hidden='true'] svg.lucide-check",
+      cardTitleSelector: "h3",
+      cardWikipediaLinkSelector: "a[href*='wikipedia.org/wiki/']",
+      // Rareté encodée dans une classe CSS type "glow-UR" (repli si non taggée par main-tagger.js).
+      rarityGlowClassRegex: /\bglow-([\w-]+)/i,
     },
 
     // ------------------------------------------------------------------
-    // Chargement de cartes supplémentaires (⚠️ à confirmer)
+    // ✅ Chargement de cartes supplémentaires (réponses vérifiées)
     // ------------------------------------------------------------------
     // "auto"  : clique un bouton du type "Voir plus / Suivant" s'il existe,
     //           sinon fait défiler la zone principale (scroll infini).
-    // "none"  : ne traite que les cartes déjà affichées.
+    // "none"  : ne traite que les cartes déjà affichées (aucun scroll, aucun clic).
     pagination: {
-      mode: "auto",
+      mode: "none",
       loadMoreTextRegex: "(voir|charger|afficher|montrer)\\s+(plus|davantage)|suivant|load more",
       waitAfterTriggerMs: 900,
       maxStaleAttempts: 3, // tentatives sans nouvelle carte avant de conclure "terminé"
+    },
+    
+    // ------------------------------------------------------------------
+    // Mise aux enchères groupée (page Collection) — ⚠️ à confirmer
+    // ------------------------------------------------------------------
+    auction: {
+      // Nombre de cartes traitées simultanément. Choix arbitraire du script
+      // d'origine, pas de contrainte du site — ajuster librement.
+      maxSelection: 5,
+      durations: [
+        { label: "10 min", minutes: 10},
+        { label: "30 min", minutes: 30},
+        { label: "1 h", minutes: 60},
+        { label: "3 h", minutes: 180},
+        { label: "6 h", minutes: 360},
+        { label: "12 h", minutes: 720},
+      ],
     },
 
     // ------------------------------------------------------------------
@@ -77,6 +102,25 @@
           const bucket = json && json.summary && rarity ? json.summary[rarity] : null;
           return bucket && typeof bucket.average === "number" ? bucket.average : null;
         },
+      },
+
+      // Repli uniquement : utilisé si une carte cochée n'est pas retrouvée
+      // via les tags de main-tagger.js (vois auction-adapter.js).
+      myCollection: {
+        pathHint: "/api/my-collection",
+        url: () => "/api/my-collection",
+        parseList: (json) => (json && (json.collection || json)) || [],
+      },
+
+      // Création d'une enchère
+      createAuction: {
+        url: () => "/api/marketplace",
+        buildBody: ({ cardId, baseAmount, durationMinutes }) => ({
+          card_id: cardId,
+          base_amount: baseAmount,
+          duration_minutes: durationMinutes,
+        }),
+        parseResult: (json) => ({ auctionId: json && json.auction_id}),
       },
     },
 

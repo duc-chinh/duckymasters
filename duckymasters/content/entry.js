@@ -21,6 +21,7 @@
     onPause: () => runner.pause(),
     onContinue: () => runner.continueRun(),
     onRestart: () => runner.restart(),
+    onRelaunch: () => runner.relaunch(),
     onClose: () => {
       runner.stop();
       bubble.destroy();

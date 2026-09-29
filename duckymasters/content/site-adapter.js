@@ -41,6 +41,10 @@
       color: var(--color-foreground, #ddd); opacity: .75;
       border-color: var(--color-border, rgba(255,255,255,.15));
     }
+    .${BADGE_CLASS}.is-error {
+      color: #ff6b6b; opacity: .75;
+      border-color: rgba(255,107,107,.35);
+    }
     .${BADGE_CLASS}--bottom-left  { left: 6px;  bottom: 6px; }
     .${BADGE_CLASS}--bottom-right { right: 6px; bottom: 6px; }
     .${BADGE_CLASS}--top-left     { left: 6px;  top: 6px; }
@@ -148,6 +152,27 @@
       return node.hasAttribute(BADGE_ATTR);
     },
 
+    /** Carte marquée en erreur (réseau ou HTTP) - doit être retentée. */
+    hasError(node) {
+      const v = node.getAttribute(BADGE_ATTR);
+      return v != null && v.indexOf("error:") === 0;
+    },
+
+    /** Carte "terminée" (valeur ou "aucune vente") - ne doit plus être retraitée. */
+    isDone(node) {
+      return this.hasBadge(node) && !this.hasError(node);
+    },
+
+    /** Valeur numérique déjà affichée sur le badge "Prix moyen" de la carte (ou null si
+     *  aucun badge, badge "aucune vent", ou badge en erreur). */
+    getAverageFromBadge(node) {
+      if(!this.isDone(node)) return null; // pas de badge, ou badge en erreur -> rien d'exploitable
+      const raw = node.getAttribute(BADGE_ATTR);
+      if (raw == null) return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    },
+
     clearBadge(node) {
       node.removeAttribute(BADGE_ATTR);
       const existing = node.querySelector(`.${BADGE_CLASS}`);
@@ -155,7 +180,7 @@
     },
 
     /** Pose (ou met à jour) la pastille de prix moyen en surimpression sur la carte. */
-    injectBadge(node, { average, rarity }) {
+    injectBadge(node, { average, rarity, errorCode }) {
       ensureBadgeStyle();
       if (getComputedStyle(node).position === "static") node.style.position = "relative";
 
@@ -169,7 +194,12 @@
 
       const value = badge.querySelector(".dm-badge__value");
       const label = badge.querySelector(".dm-badge__label");
-      if (average == null) {
+      if (errorCode) {
+        badge.classList.add("is-error");
+        value.textContent = `ERR ${errorCode}`;
+        label.textContent = "";
+        badge.title = `Echec de la requête (${errorCode})${rarity ? ` — carte de rareté ${rarity}` : ""}`; 
+      } else if (average == null) {
         badge.classList.add("is-empty");
         value.textContent = "—";
         label.textContent = "";
@@ -179,7 +209,7 @@
         label.textContent = "moy.";
         badge.title = `Prix moyen de vente : ${this.formatPrice(average)}${rarity ? ` (rareté ${rarity})` : ""}`;
       }
-      node.setAttribute(BADGE_ATTR, average == null ? "n/a" : String(average));
+      node.setAttribute(BADGE_ATTR, errorCode ? `error:${errorCode}` : average == null ? "n/a" : String(average));
     },
 
     getScrollTop() {
@@ -203,6 +233,7 @@
 
       const scroller = qs(document, CFG.selectors.scrollContainer) || document.scrollingElement;
       let re = null;
+      
       try {
         re = new RegExp(loadMoreTextRegex, "i");
       } catch (e) {
