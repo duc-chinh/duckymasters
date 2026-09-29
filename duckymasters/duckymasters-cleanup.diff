@@ -1,0 +1,1010 @@
+diff -ruN a/content/auction-adapter.js b/content/auction-adapter.js
+--- a/content/auction-adapter.js	2026-09-29 22:47:07.207244198 +0000
++++ b/content/auction-adapter.js	2026-09-29 22:47:07.209032773 +0000
+@@ -5,13 +5,12 @@
+ *  Lecture de la sélection de cartes (page Collection) et appel de l'API de
+ *  mise aux enchères. Aucune logique d'affichage ici (voir auction-panel.js).
+ *
+-*  Résolution de l'id d'exemplaire pour chaque carte cochée, par ordre de
+-*  préférence :
+-*   1) tags posés par main-tagger.js (data-dm-card-id / data-dm-rarity) —
+-*      ⚠️ à confirmer : cet id doit correspondre à celui attendu par
+-*      POST /api/marketplace (même famille que auctionDetail.card_id).
+-*   2) repli : /api/my-collection + rapprochement par URL Wikipedia / titre
+-*      / rareté (repris du script d'origine), si (1) échoue pour une carte.
++*  Résolution de l'id d'exemplaire pour chaque carte cochée :
++*   1) tags posés par main-tagger.js (data-dm-card-id / data-dm-rarity) donnent
++*      l'id de la carte et sa rareté ;
++*   2) /api/my-collection + rapprochement (card_id + rareté) donnent l'id de
++*      l'exemplaire, celui attendu par POST /api/marketplace
++*      (⚠️ à confirmer : même famille que auctionDetail.card_id).
+ * ============================================================================
+ */
+ 
+@@ -19,31 +18,16 @@
+   const CFG = global.DuckyMasters.SITE_CONFIG;
+   const SEL = CFG.selectors;
+   const Adapter = global.DuckyMasters.Adapter;
++  const { sleep, qs, qsa } = global.DuckyMasters.Utils;
+ 
+-  const MAX_ATTEMPS = 4;
+-
+-  function qs(root, selector) {
+-    try {
+-      return root.querySelector(selector);
+-    } catch (e) {
+-      return null;
+-    }
+-  }
+-
+-  function qsa(root, selector) {
+-    try {
+-      return Array.from(root.querySelectorAll(selector));
+-    } catch (e) {
+-      return [];
+-    }
+-  }
++  // Nombre max de tentatives par carte en cas d'erreur TECHNIQUE (HTTP / réseau / JSON invalide).
++  // Une réponse 200 valide indiquant « aucune vente pour cette rareté » n'est PAS une erreur : jamais retentée.
++  const MAX_ATTEMPTS = 4;
+ 
+   function normalizeText(s) {
+     return (s || "").replace(/\s+/g, " ").trim();
+   }
+ 
+-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+-
+   const AuctionAdapter = {
+     /** Éléments racine des cartes actuellement cochées (icône de coche visible). */
+     getSelectedCardNodes() {
+@@ -100,7 +84,7 @@
+ 
+     /**
+      * Résout les cartes cochées (limitées à CFG.auction.maxSelection) vers
+-     * [{ title, rarity, cardId, average, hasBadge, id }].
++     * [{ title, rarity, cardId, average, hasResult, id }].
+      * `cardId` reste null si aucune résolution (tag + repli) n'a fonctionné —
+      * c'est à l'appelant (auction-panel.js) de le signaler à l'utilisateur.
+      * average provient d'abord du badge déjà posé sur la carte ; s'il est
+@@ -123,73 +107,84 @@
+           rarity: (tagged && tagged.rarity) || this.getGlowRarity(node),
+           cardId: tagged ? tagged.cardId : null,
+           average: tagged && tagged.taggedNode ? Adapter.getAverageFromBadge(tagged.taggedNode) : null,
+-          hasBadge: tagged && tagged.taggedNode ? Adapter.hasBadge(tagged.taggedNode) : null,
++          // true si le badge porte déjà un résultat exploitable (valeur ou « aucune vente »), pas une erreur.
++          hasResult: tagged && tagged.taggedNode ? Adapter.isDone(tagged.taggedNode) : false,
+           id: null,
+         };
+       });
+ 
+       await this.resolveId(resolved);
+-      // Repli API pour les cartes sans badge (module "Prix moyen des cartes") jamais
+-      // lancé sur cette carte, ou badge effacé) : une requête par carte manquante,
+-      // au même endpoint / avec le même délai de politesse que runner.js.
++      // Repli API pour les cartes sans résultat de badge (module "Prix moyen des cartes"
++      // jamais lancé sur cette carte, badge effacé ou en erreur) : une requête par carte
++      // manquante, au même endpoint / avec le même délai de politesse que runner.js.
+       await this._resolveAveragesViaApi(resolved);
+ 
+       return { items: resolved, truncatedCount };
+     },
+- 
++
++    /**
++     * Associe à chaque carte cochée l'id d'un exemplaire de la collection (item.id).
++     * Deux cartes identiques (même carte, même rareté) reçoivent deux exemplaires
++     * différents : un exemplaire déjà attribué n'est jamais réutilisé.
++     */
+     async resolveId(items) {
+-      let collection = await this._fetchCollection();
++      const collection = await this._fetchCollection();
++      const used = new Set();
+       items.forEach((item) => {
+-        const sameCard = (e) => e.card_id === item.cardId && e.card.rarity === item.rarity;
+-        const match = collection.find((e) => sameCard(e));
+-        if (match) item.id = match.id;
++        const match = collection.find(
++          (e) => !used.has(e.id) && e.card_id === item.cardId && e.card && e.card.rarity === item.rarity
++        );
++        if (match) {
++          item.id = match.id;
++          used.add(match.id);
++        }
+       });
+     },
+ 
+     /**
+      * Complète item.average pour les cartes résolues (cardId + rareté connus)
+-     * dont le badge n'a fourni aucune valeur. Une requête par carte manquante
++     * dont le badge n'a fourni aucun résultat. Une requête par carte manquante
+      * (une réponse couvre toutes les raretés, mise en cache), en respectant
+      * CFG.requestDelayMs entre deux appels. En cas d'échec d'une carte,
+      * item.average reste null - l'appelant l'affiche alors comme vide.
+      */
+     async _resolveAveragesViaApi(items) {
+-      const targets = items.filter((it) => it.cardId && it.rarity && !it.hasBadge);
++      const targets = items.filter((it) => it.cardId && it.rarity && !it.hasResult);
+       if (!targets.length) return;
+ 
+-      // Nombre max de tentatives par carte en cas d'erreur TECHNIQUE (HTTP/réseau/JSON/invalde).
+-      // Une réponse 200 valide indiquant simplement "aucune vente pour cette rareté" n'est PAS
+-      // une erreur : elle n'est jamais retentée.
+-
+-      const cache = new Map(); // cardId -> json (une réponse couvre toutes les raretés)
++      const cache = new Map(); // cardId -> json
++      let isFirstRequest = true;
+       for (const item of targets) {
+         try {
+-          let json;
+-          if (cache.has(item.cardId)) {
+-            json = cache.get(item.cardId);
+-          } else {
+-            let lastError = null;
+-            for (let attempt = 1; attempt <= MAX_ATTEMPS; attempt++) {
+-              try {
+-                const res = await fetch(CFG.api.salesAverage.url(item.cardId), { credentials: "include" });
+-                const body = await res.json().catch(() => null);
+-                if (!res.ok || !body) throw new Error(`Sales HTTP ${res.status}`);
+-                json = body; // Succès HTTP + JSON valide : on sort
+-                break;
+-              } catch (e) {
+-                lastError = e;
+-              }
+-            }
+-            if (json === undefined) throw lastError || new Error("Sales: échec après plusieurs tentatives");
+-            cache.set(item.cardId, json);
++          if (!cache.has(item.cardId)) {
++            if (!isFirstRequest) await sleep(CFG.requestDelayMs);
++            isFirstRequest = false;
++            cache.set(item.cardId, await this._fetchSalesSummary(item.cardId));
+           }
+-          item.average = CFG.api.salesAverage.parseAverage(json, item.rarity);
++          item.average = CFG.api.salesAverage.parseAverage(cache.get(item.cardId), item.rarity);
+         } catch (e) {
+           // item.average reste null ; échec silencieux, non bloquant pour l'ouverture du panneau.
+         }
+       }
+     },
+ 
++    /** GET du résumé des ventes d'une carte, avec MAX_ATTEMPTS essais espacés en cas d'erreur technique. */
++    async _fetchSalesSummary(cardId) {
++      let lastError = null;
++      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
++        try {
++          const res = await fetch(CFG.api.salesAverage.url(cardId), { credentials: "include" });
++          const body = await res.json().catch(() => null);
++          if (!res.ok || !body) throw new Error(`Sales HTTP ${res.status}`);
++          return body;
++        } catch (e) {
++          lastError = e;
++          if (attempt < MAX_ATTEMPTS) await sleep(CFG.requestDelayMs);
++        }
++      }
++      throw lastError;
++    },
++
+     async _fetchCollection() {
+       const guessed = performance
+         .getEntriesByType("resource")
+diff -ruN a/content/auction-entry.js b/content/auction-entry.js
+--- a/content/auction-entry.js	2026-09-29 22:47:07.207270813 +0000
++++ b/content/auction-entry.js	2026-09-29 22:47:07.209132061 +0000
+@@ -19,47 +19,44 @@
+ 
+   const NS = window.DuckyMasters;
+   const CFG = NS.SITE_CONFIG;
+-
+-  function sleep(ms) {
+-    return new Promise((resolve) => setTimeout(resolve, ms));
+-  }
++  const { sleep } = NS.Utils;
+ 
+   /**
+-   * Soumet `rows` séquentiellement. `previousResults` (optionnel) : les entrées
+-   * dont le cardId est dans `rows` sont remplacées par le nouveau résultat (cas
+-   * d'une relance sur échecs); les autres sont conservées.
++   * Soumet `rows` séquentiellement, avec un délai entre chaque requête.
++   *
++   * Un seul essai par enchère : la création est un POST non idempotent, donc
++   * une relance automatique pourrait publier deux fois la même carte si le
++   * serveur a traité la première requête mais que la réponse s'est perdue.
+    */
+   async function submitRows(rows, panel) {
+     panel.setSubmitting(true);
+     const results = [];
+ 
+-    for (let i = 0; i < rows.length; i++) {
+-      const row = rows[i];
+-      for(j = 0; j < 3; j++) {
++    try {
++      for (let i = 0; i < rows.length; i++) {
++        const row = rows[i];
+         try {
+           const { auctionId } = await NS.AuctionAdapter.createAuction({
+             cardId: row.cardId,
+             baseAmount: row.baseAmount,
+             durationMinutes: row.durationMinutes,
+           });
+-          results.push({ cardId: row.cardId, title: row.title, ok: true, auctionId });
+-          break;
++          results.push({ title: row.title, ok: true, auctionId });
+         } catch (err) {
+-            const detail = (err && err.payload && JSON.stringify(err.payload)) || (err && err.message) || "Erreur inconnue";
+-            results.push({ cardId: row.cardId, title: row.title, ok: false, error: detail, row });
++          const detail = (err && err.payload && JSON.stringify(err.payload)) || (err && err.message) || "Erreur inconnue";
++          results.push({ title: row.title, ok: false, error: detail });
+         }
++        panel.setSubmitProgress(i + 1, rows.length);
++        if (i < rows.length - 1) await sleep(CFG.requestDelayMs);
+       }
+-      panel.setSubmitProgress(i + 1, rows.length);
+-      if (i < rows.length - 1) await sleep(CFG.requestDelayMs);
++    } finally {
++      // Quoi qu'il arrive, on réactive le panneau et on affiche ce qui a été fait.
++      panel.setSubmitting(false);
++      panel.setResults(results);
+     }
+-
+-    panel.setSubmitting(false);
+-    panel.setResults(results);
+-    return results;
+   }
+ 
+   async function init() {
+-    
+     let resolution;
+     try {
+       resolution = await NS.AuctionAdapter.resolveSelectedCards();
+@@ -75,16 +72,13 @@
+       return;
+     }
+ 
+-    let panel;
+-    panel = NS.AuctionPanel.mount(items, {
++    const panel = NS.AuctionPanel.mount(items, {
+       durations: CFG.auction.durations,
+       truncatedCount,
+-      onSubmit: async (rows) => {
+-        await submitRows(rows, panel);
+-      },
++      onSubmit: (rows) => submitRows(rows, panel),
+       onClose: () => panel.destroy(),
+     });
+   }
+-  
+-  init();
++
++  init().catch((err) => alert("Erreur inattendue : " + (err && err.message)));
+ })();
+diff -ruN a/content/auction-panel.js b/content/auction-panel.js
+--- a/content/auction-panel.js	2026-09-29 22:47:07.207285571 +0000
++++ b/content/auction-panel.js	2026-09-29 22:47:07.209111650 +0000
+@@ -9,7 +9,9 @@
+ */
+ (function (global) {
+   const HOST_ID = "duckymasters-auction-panel-host";
+- 
++  const { el } = global.DuckyMasters.Utils;
++  const { COIN_SVG, formatNumber } = global.DuckyMasters.Adapter;
++
+   const STYLE = `
+     :host { all: initial; }
+     .dm-root {
+@@ -75,11 +77,10 @@
+       align-items: center;
+       padding: 9px 10px;
+       border-bottom: 1px solid rgba(247,244,236,0.1);
+-      align-items: center;
+     }
+     .dm-row:last-child { border-bottom: none; }
+     .dm-row.dm-row--invalid { opacity: 0.55; }
+-    .dm-row.title-block { min-width: 0;}
++    .dm-row-title-block { min-width: 0; }
+     .dm-row-title { font-size: 12px; font-weight: 600; }
+     .dm-row-meta { font-size: 11px; color: #B9C6CC; margin-top: 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+     .dm-avg-badge {
+@@ -100,7 +101,7 @@
+       border-radius: 7px;
+       border: 1px solid rgba(247,244,236,0.2);
+       background: #10262F;
+-      color: #F7F3EC;
++      color: #F7F4EC;
+       font-size: 12px;
+       text-align: right;
+       box-sizing: border-box;
+@@ -149,38 +150,18 @@
+     .dm-result-block b { display: block; margin-bottom: 4px; }
+     .dm-result-block .dm-btn { margin-top: 8px; }
+   `;
+- 
+-  function el(tag, props, children) {
+-    const node = document.createElement(tag);
+-    Object.entries(props || {}).forEach(([k, v]) => {
+-      if (k === "class") node.className = v;
+-      else if (k === "text") node.textContent = v;
+-      else node.setAttribute(k, v);
+-    });
+-    (children || []).forEach((c) => node.appendChild(c));
+-    return node;
+-  }
+ 
+   /** Accord simple singulier/pluriel (0 ou 1 -> singulier, comme le fait déjà formatPrice() côté prix). */
+   function pluralize(n, singular, plural) {
+     return Math.abs(n) <= 1 ? singular : plural;
+   }
+ 
+-  /** Formatage identique à celui du badge posé sur la carte (site-adapter.js: formatNumber). */
+-  function formatAverage(n) {
+-    return n.toLocaleString("fr-FR", { maximumFractionDigits: 2});    
+-  }
+-
+-  const AVG_BADGE_ICON =
+-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+-    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+-    '<circle cx="12" r="9"></circle><path d="M7.5 8.5 9.5 15.5 12 10 14.5 15.5 16.5 8.5"></path></svg>';
+-
+-  /** Pastille identique au badge posé sur la carte (site-adapter.js: injectBadge) */
+-  function buildAverageBadgeText(average) {
++  /** Pastille identique au badge posé sur la carte (même icône et même format que site-adapter.js). */
++  function buildAverageBadge(average) {
+     const badge = el("span", { class: "dm-avg-badge" + (average == null ? " is-empty" : "") });
+-    badge.innerHTML = AVG_BADGE_ICON +
+-      `<span class="dm-avg-badge__value">${average == null ? "—" : formatAverage(average)}</span>` +
++    badge.innerHTML =
++      COIN_SVG +
++      `<span class="dm-avg-badge__value">${average == null ? "—" : formatNumber(average)}</span>` +
+       (average == null ? "" : `<span class="dm-avg-badge__label">moy.</span>`);
+     return badge;
+   }
+@@ -195,20 +176,20 @@
+     mount(items, opts) {
+       const existingHost = document.getElementById(HOST_ID);
+       if (existingHost) existingHost.remove();
+- 
++
+       const host = document.createElement("div");
+       host.id = HOST_ID;
+       const shadow = host.attachShadow({ mode: "open" });
+- 
++
+       const styleTag = document.createElement("style");
+       styleTag.textContent = STYLE;
+       shadow.appendChild(styleTag);
+- 
++
+       const root = el("div", { class: "dm-root" });
+ 
+       const closeBtn = el("button", { class: "dm-btn dm-btn--icon", type: "button", text: "✕" });
+       closeBtn.addEventListener("click", () => opts.onClose && opts.onClose());
+- 
++
+       const header = el("div", { class: "dm-header", title: "Glisser pour déplacer" }, [
+         el("div", { class: "dm-grip", text: "⠿" }),
+         el("div", { class: "dm-emoji", text: "⚖️" }),
+@@ -216,7 +197,8 @@
+         closeBtn,
+       ]);
+ 
+-      const validItems = items.filter((it) => it.cardId);
++      // Une carte n'est publiable que si elle a été associée à un exemplaire de la collection (item.id).
++      const validItems = items.filter((it) => it.id);
+       const missingCount = items.length - validItems.length;
+ 
+       const hintText = missingCount
+@@ -257,10 +239,10 @@
+       const durationSelects = []; // aligné sur `items` (null si carte non associée)
+       const rowsWrap = el("div", { class: "dm-rows" });
+       items.forEach((item) => {
+-        const isValid = !!item.cardId;
++        const isValid = !!item.id;
+         let priceInput = null;
+         let durationSelectRow = null;
+-        
++
+         // Toujours 3 cellules (titres / prix / durée), même vides, pour garder
+         // les colonnes alignées entre toutes les lignes (dont "Non associée").
+         let priceCell = el("div", {});
+@@ -283,7 +265,7 @@
+ 
+         const metaLine = el("div", { class: "dm-row-meta" });
+         if (item.rarity) metaLine.appendChild(document.createTextNode(item.rarity + " - "));
+-        metaLine.appendChild(buildAverageBadgeText(item.average));
++        metaLine.appendChild(buildAverageBadge(item.average));
+         const titleBlock = el("div", { class: "dm-row-title-block" }, [
+           el("div", { class: "dm-row-title", text: item.title }),
+           metaLine,
+@@ -309,16 +291,18 @@
+       const actions = el("div", { class: "dm-actions" }, [submitProgressEl, submitBtn]);
+ 
+       const resultsWrap = el("div", { class: "dm-results" });
++      let hasPublished = false; // au moins une enchère créée : la collection affichée est périmée
+ 
+       submitBtn.addEventListener("click", () => {
+         const rows = [];
+         let invalidPrice = false;
+         items.forEach((item, i) => {
+-          if (!item.cardId) return;
++          if (!item.id) return;
+           const raw = priceInputs[i] ? priceInputs[i].value : "";
+           const baseAmount = Number(raw);
+           const durationMinutes = Number(durationSelects[i] ? durationSelects[i].value : durationSelect.value);
+           if (!Number.isInteger(baseAmount) || baseAmount < 1) invalidPrice = true;
++          // L'API attend l'id de l'exemplaire (item.id), passé sous le nom `cardId` (cf. site-config.js).
+           rows.push({ cardId: item.id, title: item.title, baseAmount, durationMinutes });
+         });
+ 
+@@ -373,7 +357,7 @@
+       };
+       header.addEventListener("pointerup", endDrag);
+       header.addEventListener("pointercancel", endDrag);
+- 
++
+       return {
+         setSubmitting(isSubmitting) {
+           submitBtn.disabled = isSubmitting || validItems.length === 0;
+@@ -391,6 +375,7 @@
+           resultsWrap.innerHTML = "";
+           const ok = results.filter((r) => r.ok);
+           const failed = results.filter((r) => !r.ok);
++          hasPublished = hasPublished || ok.length > 0;
+           if (ok.length) {
+             resultsWrap.appendChild(
+               el("div", { class: "dm-result-block dm-result-block--ok" }, [
+@@ -409,9 +394,10 @@
+           }
+         },
+         destroy() {
+-          location.reload();
+           host.remove();
+-       },
++          // Les cartes mises aux enchères ont quitté la collection : on recharge pour refléter l'état réel.
++          if (hasPublished) global.location.reload();
++        },
+       };
+     },
+   };
+diff -ruN a/content/bubble.js b/content/bubble.js
+--- a/content/bubble.js	2026-09-29 22:47:07.207306728 +0000
++++ b/content/bubble.js	2026-09-29 22:47:07.209071747 +0000
+@@ -9,6 +9,7 @@
+  */
+ (function (global) {
+   const HOST_ID = "duckymasters-bubble-host";
++  const { el } = global.DuckyMasters.Utils;
+   const MAX_LOG_ENTRIES = 300;
+ 
+   const STYLE = `
+@@ -112,7 +113,7 @@
+       left: 0;
+       right: 0;
+       bottom: 100%;
+-      margin-bottom: 8 px;
++      margin-bottom: 8px;
+       z-index: 5;
+       max-height: 190px;
+       overflow-y: auto;
+@@ -144,25 +145,20 @@
+     }
+   `;
+ 
+-  function el(tag, props, children) {
+-    const node = document.createElement(tag);
+-    Object.entries(props || {}).forEach(([k, v]) => {
+-      if (k === "class") node.className = v;
+-      else if (k === "text") node.textContent = v;
+-      else node.setAttribute(k, v);
+-    });
+-    (children || []).forEach((c) => node.appendChild(c));
+-    return node;
++  function formatTime(ts) {
++    return new Date(ts).toLocaleTimeString("fr-FR", { hour12: false });
+   }
+ 
+-  function formatTime(ts) {
+-    const d = new Date(ts);
+-    return d.toLocaleTimeString("fr-FR", { hour12: false });
++  /** Bouton de la bulle ; `onClick` est optionnel côté appelant (callbacks facultatifs). */
++  function button(label, className, onClick) {
++    const btn = el("button", { class: "dm-btn" + (className ? " " + className : ""), type: "button", text: label });
++    btn.addEventListener("click", () => onClick && onClick());
++    return btn;
+   }
+ 
+   const Bubble = {
+     /**
+-     * @param {object} opts { title, onPause, onContinue, onRestart, onClose }
++     * @param {object} opts { title, onPause, onContinue, onRestart, onRelaunch, onClose }
+      * @returns controller
+      */
+     mount(opts) {
+@@ -215,7 +211,6 @@
+       document.documentElement.appendChild(host);
+ 
+       let consoleOpen = false;
+-      let logCount = 0;
+ 
+       // ---------------- Déplacement de la fenêtre ----------------
+       const POS_KEY = "duckymasters.bubblePos";
+@@ -266,7 +261,8 @@
+         if (moved) place(parseFloat(root.style.left), parseFloat(root.style.top));
+       };
+       window.addEventListener("resize", keepInside);
+-      if (typeof ResizeObserver !== "undefined") new ResizeObserver(keepInside).observe(root);
++      const resizeObserver = typeof ResizeObserver !== "undefined" ? new ResizeObserver(keepInside) : null;
++      if (resizeObserver) resizeObserver.observe(root);
+ 
+       // Retrouve la dernière position choisie.
+       try {
+@@ -280,35 +276,25 @@
+ 
+       function renderActions(state) {
+         actionsRow.innerHTML = "";
+-        const consoleBtn = el("button", {
+-          class: "dm-btn dm-btn--icon" + (consoleOpen ? " dm-btn--active" : ""),
+-          type: "button",
+-          text: "Console",
+-        });
+-        consoleBtn.addEventListener("click", () => {
++        const consoleBtn = button("Console", "dm-btn--icon" + (consoleOpen ? " dm-btn--active" : ""), () => {
+           consoleOpen = !consoleOpen;
+           consolePanel.classList.toggle("dm-console--open", consoleOpen);
+           renderActions(state);
+           if (consoleOpen) consolePanel.scrollTop = consolePanel.scrollHeight;
+         });
+-
+-        const closeBtn = el("button", { class: "dm-btn dm-btn--icon", type: "button", text: "✕" });
+-        closeBtn.addEventListener("click", () => opts.onClose && opts.onClose());
++        const closeBtn = button("✕", "dm-btn--icon", opts.onClose);
+ 
+         if (state === "paused") {
+-          const continueBtn = el("button", { class: "dm-btn dm-btn--primary", type: "button", text: "Continuer" });
+-          continueBtn.addEventListener("click", () => opts.onContinue && opts.onContinue());
+-          const restartBtn = el("button", { class: "dm-btn", type: "button", text: "Recommencer" });
+-          restartBtn.addEventListener("click", () => opts.onRestart && opts.onRestart());
+-          actionsRow.append(continueBtn, restartBtn, consoleBtn, closeBtn);
++          actionsRow.append(
++            button("Continuer", "dm-btn--primary", opts.onContinue),
++            button("Recommencer", "", opts.onRestart),
++            consoleBtn,
++            closeBtn
++          );
+         } else if (state === "done" || state === "stopped") {
+-          const launchBtn = el("button", { class: "dm-btn dm-btn--primary", type: "button", text: "Lancer" });
+-          launchBtn.addEventListener("click", () => opts.onRelaunch && opts.onRelaunch());
+-          actionsRow.append(launchBtn, consoleBtn, closeBtn);
++          actionsRow.append(button("Lancer", "dm-btn--primary", opts.onRelaunch), consoleBtn, closeBtn);
+         } else {
+-          const pauseBtn = el("button", { class: "dm-btn", type: "button", text: "Pause" });
+-          pauseBtn.addEventListener("click", () => opts.onPause && opts.onPause());
+-          actionsRow.append(pauseBtn, consoleBtn, closeBtn);
++          actionsRow.append(button("Pause", "", opts.onPause), consoleBtn, closeBtn);
+         }
+       }
+ 
+@@ -343,20 +329,18 @@
+           renderActions(state);
+         },
+         appendLog(entry) {
+-          logCount++;
+           const line = el("div", { class: "dm-log-line" }, [
+             el("div", { class: `dm-log-dot dm-log-dot--${entry.type || "info"}` }),
+             el("div", { class: "dm-log-time", text: formatTime(entry.ts) }),
+             el("div", { class: "dm-log-text", text: entry.text }),
+           ]);
+           consolePanel.appendChild(line);
+-          if (logCount > MAX_LOG_ENTRIES) {
+-            consolePanel.removeChild(consolePanel.firstChild);
+-          }
++          if (consolePanel.childElementCount > MAX_LOG_ENTRIES) consolePanel.firstChild.remove();
+           if (consoleOpen) consolePanel.scrollTop = consolePanel.scrollHeight;
+         },
+         destroy() {
+           window.removeEventListener("resize", keepInside);
++          if (resizeObserver) resizeObserver.disconnect();
+           host.remove();
+         },
+       };
+diff -ruN a/content/main-tagger.js b/content/main-tagger.js
+--- a/content/main-tagger.js	2026-09-29 22:47:07.207342554 +0000
++++ b/content/main-tagger.js	2026-09-29 22:47:07.209150936 +0000
+@@ -131,10 +131,8 @@
+     const scope = document.querySelector("main") || document.body;
+     const found = new Map(); // élément racine -> {cardId, rarity}
+     const all = scope.querySelectorAll("*");
+-    let scanned = 0;
+ 
+     for (let i = 0; i < all.length; i++) {
+-      scanned++;
+       const r = resolve(all[i]);
+       if (!r) continue;
+       const host = topHostElement(r.fiber);
+@@ -162,7 +160,7 @@
+       tagged++;
+     });
+ 
+-    diagnose(scope, scanned, tagged);
++    diagnose(scope, all.length, tagged);
+     return tagged;
+   }
+ 
+diff -ruN a/content/runner.js b/content/runner.js
+--- a/content/runner.js	2026-09-29 22:47:07.207357577 +0000
++++ b/content/runner.js	2026-09-29 22:47:07.209091386 +0000
+@@ -13,9 +13,9 @@
+ (function (global) {
+   const CFG = global.DuckyMasters.SITE_CONFIG;
+   const Adapter = global.DuckyMasters.Adapter;
++  const { sleep } = global.DuckyMasters.Utils;
+ 
+   const MAX_ITERATIONS_SAFETY = 20000;
+-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+ 
+   class AveragePriceRunner {
+     /** callbacks: onStateChange, onProgress({processed,total}), onLog, onMeta, onResult */
+@@ -25,7 +25,7 @@
+       this.pageType = Adapter.detectPageType();
+       this._iterations = 0;
+       this._cache = new Map(); // cardId -> réponse JSON (une réponse couvre toutes les raretés)
+-      this._scrollTop0 = null;
++      this._attempted = new WeakSet(); // cartes déjà tentées pendant ce passage (évite de rejouer une carte en erreur en boucle)
+       this._runId = 0; // identifie la boucle active (évite deux boucles en parallèle)
+     }
+ 
+@@ -70,7 +70,7 @@
+         this._cache.clear();
+         this._log({ type: "info", text: "Recommencé : les valeurs déjà affichées ont été effacées." });
+       }
+-      if (this._scrollTop0 === null) this._scrollTop0 = Adapter.getScrollTop();
++      this._attempted = new WeakSet();
+ 
+       const found = Adapter.getCardNodes().length;
+       this._log({
+@@ -182,15 +182,18 @@
+           return;
+         }
+ 
++        // Une carte en erreur n'est retentée qu'au prochain passage (bouton « Lancer »), pas en boucle.
++        const isPending = (n) => !Adapter.isDone(n) && !this._attempted.has(n);
++
+         let nodes = Adapter.getCardNodes();
+         this._reportProgress(nodes.filter((n) => Adapter.isDone(n)).length, nodes.length);
+-        let next = nodes.find((n) => !Adapter.isDone(n));
++        let next = nodes.find(isPending);
+ 
+         if (!next) {
+           // Peut-être des cartes re-rendues par le site depuis le dernier marquage.
+           Adapter.refreshTags();
+           nodes = Adapter.getCardNodes();
+-          next = nodes.find((n) => !Adapter.isDone(n));
++          next = nodes.find(isPending);
+         }
+ 
+         if (!next) {
+@@ -200,10 +203,11 @@
+             this._log({ type: "info", text: "Nouvelles cartes chargées, poursuite du script." });
+             continue;
+           }
+-          this._finishList(nodes.length);
++          this._finishList(nodes);
+           return;
+         }
+ 
++        this._attempted.add(next);
+         const cardId = Adapter.getCardId(next);
+         const rarity = Adapter.getCardRarity(next);
+         if (!cardId || !rarity) {
+@@ -224,18 +228,23 @@
+       }
+     }
+ 
+-    _finishList(total) {
++    _finishList(nodes) {
++      const total = nodes.length;
+       if (total === 0) {
+         this._log({
+           type: "error",
+-          text: "Aucune carte détectée. Envoie-moi le diagnostic ci-dessus et le HTML d'une carte (voir README).",
++          text: "Aucune carte détectée. Consultez le diagnostic ci-dessus (voir README, section Dépannage).",
+         });
+         this._setState("stopped");
+         return;
+       }
+-      // if (this._scrollTop0 !== null) Adapter.setScrollTop(this._scrollTop0);
+-      this._reportProgress(total, total);
+-      this._log({ type: "info", text: "Toutes les cartes affichées ont été traitées." });
++      const errors = nodes.filter((n) => Adapter.hasError(n)).length;
++      this._reportProgress(total - errors, total);
++      this._log(
++        errors
++          ? { type: "error", text: `Terminé avec ${errors} carte(s) en erreur — cliquez sur « Lancer » pour les retenter.` }
++          : { type: "info", text: "Toutes les cartes affichées ont été traitées." }
++      );
+       this._setState("done");
+     }
+ 
+diff -ruN a/content/site-adapter.js b/content/site-adapter.js
+--- a/content/site-adapter.js	2026-09-29 22:47:07.207373282 +0000
++++ b/content/site-adapter.js	2026-09-29 22:47:07.209008380 +0000
+@@ -7,6 +7,7 @@
+  */
+ (function (global) {
+   const CFG = global.DuckyMasters.SITE_CONFIG;
++  const { sleep, qs, qsa } = global.DuckyMasters.Utils;
+   const BADGE_ATTR = "data-duckymasters-avg";
+   const BADGE_CLASS = "duckymasters-badge";
+   const STYLE_ID = "duckymasters-badge-style";
+@@ -51,26 +52,6 @@
+     .${BADGE_CLASS}--top-right    { right: 6px; top: 6px; }
+   `;
+ 
+-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+-
+-  function qs(root, selector) {
+-    if (!selector) return null;
+-    try {
+-      return root.querySelector(selector);
+-    } catch (e) {
+-      return null;
+-    }
+-  }
+-
+-  function qsa(root, selector) {
+-    if (!selector) return [];
+-    try {
+-      return Array.from(root.querySelectorAll(selector));
+-    } catch (e) {
+-      return [];
+-    }
+-  }
+-
+   function isVisible(el) {
+     return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+   }
+@@ -88,20 +69,12 @@
+   }
+ 
+   const Adapter = {
+-    detectPageType() {
+-      for (const [key, def] of Object.entries(CFG.pages)) {
+-        try {
+-          if (def.test(global.location)) return key;
+-        } catch (e) {
+-          /* ignore */
+-        }
+-      }
+-      return null;
+-    },
++    // Exposés pour que les autres modules (ex. panneau d'enchères) restent cohérents avec le badge.
++    COIN_SVG,
++    formatNumber,
+ 
+-    isOnWikiMasters() {
+-      const host = global.location.hostname;
+-      return CFG.hostPatterns.some((h) => host === h || host.endsWith(`.${h}`));
++    detectPageType() {
++      return CFG.detectPageType(global.location);
+     },
+ 
+     /** "11 wikibidous" (singulier pour 0 et 1, comme en français). */
+@@ -166,10 +139,8 @@
+     /** Valeur numérique déjà affichée sur le badge "Prix moyen" de la carte (ou null si
+      *  aucun badge, badge "aucune vent", ou badge en erreur). */
+     getAverageFromBadge(node) {
+-      if(!this.isDone(node)) return null; // pas de badge, ou badge en erreur -> rien d'exploitable
+-      const raw = node.getAttribute(BADGE_ATTR);
+-      if (raw == null) return null;
+-      const n = Number(raw);
++      if (!this.isDone(node)) return null; // pas de badge, ou badge en erreur -> rien d'exploitable
++      const n = Number(node.getAttribute(BADGE_ATTR));
+       return Number.isFinite(n) ? n : null;
+     },
+ 
+@@ -198,7 +169,7 @@
+         badge.classList.add("is-error");
+         value.textContent = `ERR ${errorCode}`;
+         label.textContent = "";
+-        badge.title = `Echec de la requête (${errorCode})${rarity ? ` — carte de rareté ${rarity}` : ""}`; 
++        badge.title = `Échec de la requête (${errorCode})${rarity ? ` — carte de rareté ${rarity}` : ""}`;
+       } else if (average == null) {
+         badge.classList.add("is-empty");
+         value.textContent = "—";
+@@ -212,16 +183,6 @@
+       node.setAttribute(BADGE_ATTR, errorCode ? `error:${errorCode}` : average == null ? "n/a" : String(average));
+     },
+ 
+-    getScrollTop() {
+-      const s = qs(document, CFG.selectors.scrollContainer) || document.scrollingElement;
+-      return s ? s.scrollTop : 0;
+-    },
+-
+-    setScrollTop(y) {
+-      const s = qs(document, CFG.selectors.scrollContainer) || document.scrollingElement;
+-      if (s) s.scrollTop = y;
+-    },
+-
+     /**
+      * Tente de charger d'autres cartes : clic sur un bouton "Voir plus/Suivant"
+      * s'il existe, sinon défilement de la zone principale (scroll infini).
+@@ -233,7 +194,6 @@
+ 
+       const scroller = qs(document, CFG.selectors.scrollContainer) || document.scrollingElement;
+       let re = null;
+-      
+       try {
+         re = new RegExp(loadMoreTextRegex, "i");
+       } catch (e) {
+diff -ruN a/content/site-config.js b/content/site-config.js
+--- a/content/site-config.js	2026-09-29 22:47:07.207390168 +0000
++++ b/content/site-config.js	2026-09-29 22:47:07.209190759 +0000
+@@ -38,7 +38,7 @@
+       manualCardItem: "", // sélecteur CSS d'une carte, ex: ".card-item"
+       manualIdAttribute: "", // attribut portant l'id de carte, ex: "data-id"
+       manualRaritySelector: "", // sous-élément affichant la rareté, ex: ".rarity"
+-    
++
+       // ⚠️ Sélection multiple (page Collection) — utilisés par auction-adapter.js.
+       // Icône affichée sur une carte cochée via la sélection native du site.
+       checkIconSelector: "span.pointer-events-none svg.lucide-check, span[aria-hidden='true'] svg.lucide-check",
+@@ -60,7 +60,7 @@
+       waitAfterTriggerMs: 900,
+       maxStaleAttempts: 3, // tentatives sans nouvelle carte avant de conclure "terminé"
+     },
+-    
++
+     // ------------------------------------------------------------------
+     // Mise aux enchères groupée (page Collection) — ⚠️ à confirmer
+     // ------------------------------------------------------------------
+@@ -134,6 +134,22 @@
+     requestDelayMs: 250,
+   };
+ 
++  // Helpers partagés par la popup et les scripts injectés.
++  SITE_CONFIG.isSiteHost = (hostname) =>
++    SITE_CONFIG.hostPatterns.some((h) => hostname === h || hostname.endsWith(`.${h}`));
++
++  /** Renvoie "collection" | "marche" | "carte" | null pour un objet Location ou URL. */
++  SITE_CONFIG.detectPageType = (loc) => {
++    for (const [key, def] of Object.entries(SITE_CONFIG.pages)) {
++      try {
++        if (def.test(loc)) return key;
++      } catch (e) {
++        /* ignore */
++      }
++    }
++    return null;
++  };
++
+   global.DuckyMasters = global.DuckyMasters || {};
+   global.DuckyMasters.SITE_CONFIG = SITE_CONFIG;
+ })(typeof window !== "undefined" ? window : self);
+diff -ruN a/content/utils.js b/content/utils.js
+--- a/content/utils.js	1970-01-01 00:00:00.000000000 +0000
++++ b/content/utils.js	2026-09-29 22:47:07.209176503 +0000
+@@ -0,0 +1,50 @@
++/**
++ * ============================================================================
++ *  DuckyMasters — utils.js
++ * ============================================================================
++ *  Petits utilitaires partagés par les modules de /content (DOM, temporisation).
++ *  À injecter juste après site-config.js.
++ * ============================================================================
++ */
++(function (global) {
++  const Utils = {
++    sleep(ms) {
++      return new Promise((resolve) => setTimeout(resolve, ms));
++    },
++
++    /** querySelector tolérant : renvoie null si le sélecteur est vide ou invalide. */
++    qs(root, selector) {
++      if (!selector) return null;
++      try {
++        return root.querySelector(selector);
++      } catch (e) {
++        return null;
++      }
++    },
++
++    /** querySelectorAll tolérant : renvoie [] si le sélecteur est vide ou invalide. */
++    qsa(root, selector) {
++      if (!selector) return [];
++      try {
++        return Array.from(root.querySelectorAll(selector));
++      } catch (e) {
++        return [];
++      }
++    },
++
++    /** Crée un élément. props : { class, text, ...attributs } ; children : nœuds DOM. */
++    el(tag, props, children) {
++      const node = document.createElement(tag);
++      Object.entries(props || {}).forEach(([k, v]) => {
++        if (k === "class") node.className = v;
++        else if (k === "text") node.textContent = v;
++        else node.setAttribute(k, v);
++      });
++      (children || []).forEach((c) => node.appendChild(c));
++      return node;
++    },
++  };
++
++  global.DuckyMasters = global.DuckyMasters || {};
++  global.DuckyMasters.Utils = Utils;
++})(typeof window !== "undefined" ? window : self);
+diff -ruN a/popup/popup.js b/popup/popup.js
+--- a/popup/popup.js	2026-09-29 22:47:07.207433536 +0000
++++ b/popup/popup.js	2026-09-29 22:47:07.209273924 +0000
+@@ -14,6 +14,7 @@
+       mainFiles: ["content/main-tagger.js"],
+       files: [
+         "content/site-config.js",
++        "content/utils.js",
+         "content/site-adapter.js",
+         "content/runner.js",
+         "content/bubble.js",
+@@ -29,6 +30,7 @@
+       mainFiles: ["content/main-tagger.js"],
+       files: [
+         "content/site-config.js",
++        "content/utils.js",
+         "content/site-adapter.js",
+         "content/auction-adapter.js",
+         "content/auction-panel.js",
+@@ -40,21 +42,6 @@
+   const statusEl = document.getElementById("dm-status");
+   const listEl = document.getElementById("dm-script-list");
+ 
+-  function isWikiMastersHost(hostname) {
+-    return CFG.hostPatterns.some((h) => hostname === h || hostname.endsWith(`.${h}`));
+-  }
+-
+-  function detectPageType(urlLike) {
+-    for (const [key, def] of Object.entries(CFG.pages)) {
+-      try {
+-        if (def.test(urlLike)) return key;
+-      } catch (e) {
+-        /* ignore */
+-      }
+-    }
+-    return null;
+-  }
+-
+   function showStatus(text) {
+     statusEl.textContent = text;
+     statusEl.hidden = false;
+@@ -65,17 +52,21 @@
+     SCRIPTS.forEach((script) => {
+       const enabled = onWikiMasters && pageType && script.appliesTo.includes(pageType);
+       const btn = document.createElement("button");
++      btn.type = "button";
+       btn.className = "dm-script";
+       btn.disabled = !enabled;
+       btn.innerHTML = `
+         <span class="dm-script__emoji">${script.emoji}</span>
+-        <span>
++        <div>
+           <div class="dm-script__title">${script.title}</div>
+           <div class="dm-script__desc">${script.description}</div>
+-        </span>
++        </div>
+       `;
+       btn.addEventListener("click", () => runScript(script));
+-      listEl.appendChild(btn);
++
++      const item = document.createElement("li"); // <ul> n'accepte que des <li> comme enfants directs
++      item.appendChild(btn);
++      listEl.appendChild(item);
+     });
+   }
+ 
+@@ -115,8 +106,8 @@
+       return;
+     }
+ 
+-    const onWikiMasters = isWikiMastersHost(url.hostname);
+-    const pageType = onWikiMasters ? detectPageType(url) : null;
++    const onWikiMasters = CFG.isSiteHost(url.hostname);
++    const pageType = onWikiMasters ? CFG.detectPageType(url) : null;
+ 
+     if (!onWikiMasters) {
+       showStatus("Ouvre WikiMasters (Collection, Marché, ou une carte) pour lancer un script.");
